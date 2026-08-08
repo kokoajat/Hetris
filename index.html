@@ -229,16 +229,16 @@
       <h2>TAUKO</h2>
       <div class="settings">
         <div class="row">
-          <label for="sensSide"><i class="dot" style="background:#4CC9F0"></i>Sivuttaissiirto · <span id="valSide">5</span></label>
-          <input type="range" id="sensSide" min="2.25" max="15" step="0.25" value="5">
+          <label for="sensSide"><i class="dot" style="background:#4CC9F0"></i>Sivuttaissiirto · <span id="valSide">4</span></label>
+          <input type="range" id="sensSide" min="2.25" max="15" step="0.25" value="4">
         </div>
         <div class="row">
-          <label for="sensDrop"><i class="dot" style="background:#EF476F"></i>Pudotus · <span id="valDrop">8.5</span></label>
-          <input type="range" id="sensDrop" min="2.25" max="15" step="0.25" value="8.5">
+          <label for="sensDrop"><i class="dot" style="background:#EF476F"></i>Pudotus · <span id="valDrop">7</span></label>
+          <input type="range" id="sensDrop" min="2.25" max="15" step="0.25" value="7">
         </div>
         <div class="row">
-          <label for="sensRot"><i class="dot" style="background:#C77DFF"></i>Kääntö · <span id="valRot">6</span></label>
-          <input type="range" id="sensRot" min="2.25" max="15" step="0.25" value="6">
+          <label for="sensRot"><i class="dot" style="background:#C77DFF"></i>Kääntö · <span id="valRot">5</span></label>
+          <input type="range" id="sensRot" min="2.25" max="15" step="0.25" value="5">
         </div>
         <div class="switch">
           <span>Käänteinen kopautus</span>
@@ -592,7 +592,7 @@ function updateStats(){
    pala putoaa. Kopautus oikeaan reunaan työntää vasemmalle,
    joten pala siirtyy vasemmalle.
    ========================================================= */
-const sens = { side:5, drop:8.5, rot:6 };  // kynnykset (m/s²) suunnittain
+const sens = { side:4, drop:7, rot:5 };    // kynnykset (m/s²) suunnittain
 let inverted = false;                      // kääntää kopautuslogiikan
 const METER_MAX = 18;                      // mittarin kiinteä asteikko
 let useLinear = null;        // onko acceleration-kenttä käytettävissä
@@ -615,10 +615,11 @@ function minSens(){ return Math.min(sens.side, sens.drop, sens.rot); }
 const CAPTURE_WINDOW = 60;    // ms, kuinka kauan iskua seurataan
 const REFRACTORY     = 200;   // ms, tauko onnistuneen laukaisun jälkeen
 const REJECT_PAUSE   = 90;    // ms, lyhyempi tauko hylätyn iskun jälkeen
-const DOMINANCE      = 1.35;  // voittavan akselin vaadittu ylivoima
+const GATE_FACTOR    = 0.5;   // osuus matalimmasta kynnyksestä = herätysportti
 let capturing = false, captureStart = 0;
 let leadX = 0, leadY = 0;     // akselin lukittu suunta (-1 / 0 / 1)
 let strX = 0, strY = 0;       // voimakkuus lukittuun suuntaan
+let onsetX = Infinity, onsetY = Infinity;   // milloin akseli heräsi
 let cooldownUntil = 0, armed = true;
 let meterPeak = 0;
 
@@ -629,14 +630,16 @@ function screenAngle(){
 
 function onMotion(e){
   let ax, ay;
+  const acc = e.acceleration;
+  const hasLinear = !!(acc && typeof acc.y === 'number');
 
-  if (useLinear === null){
-    useLinear = !!(e.acceleration && typeof e.acceleration.y === 'number');
-  }
+  if (useLinear === null) useLinear = hasLinear;
 
-  if (useLinear){
-    ax = e.acceleration.x || 0;
-    ay = e.acceleration.y || 0;
+  // Varareitille pudotaan tapahtumakohtaisesti: osa selaimista lähettää
+  // acceleration-kentän vain ajoittain, eikä yksi tyhjä otos saa kaataa peliä.
+  if (useLinear && hasLinear){
+    ax = acc.x || 0;
+    ay = acc.y || 0;
   } else {
     const g = e.accelerationIncludingGravity;
     if (!g || typeof g.y !== 'number') return;
@@ -663,8 +666,10 @@ function onMotion(e){
   if (now < cooldownUntil) return;
 
   if (!armed){
-    if (axisMag < minSens() * 0.35) armed = true;
-    return;
+    // Vastaheilahdus estetään odottamalla rauhallista otosta — mutta ei
+    // ikuisesti, sillä muuten heti perään tuleva kopautus jäisi syömättä.
+    if (axisMag >= minSens() * 0.35 && now - cooldownUntil < 250) return;
+    armed = true;
   }
 
   if (!capturing){
@@ -673,11 +678,12 @@ function onMotion(e){
     if (axisMag < minSens()) return;
     capturing = true; captureStart = now;
     leadX = leadY = 0; strX = strY = 0;
-    sampleTap(sx, sy);
+    onsetX = onsetY = Infinity;
+    sampleTap(sx, sy, now);
     return;
   }
 
-  sampleTap(sx, sy);
+  sampleTap(sx, sy, now);
   if (now - captureStart < CAPTURE_WINDOW) return;
 
   capturing = false;
@@ -685,12 +691,13 @@ function onMotion(e){
   cooldownUntil = now + (resolveTap() ? REFRACTORY : REJECT_PAUSE);
 }
 
-function sampleTap(sx, sy){
-  const gate = minSens() * 0.4;
+function sampleTap(sx, sy, now){
+  const gate = minSens() * GATE_FACTOR;
 
-  // lukitaan akselin suunta ensimmäisestä otoksesta, joka ylittää portin
-  if (!leadX && Math.abs(sx) >= gate) leadX = Math.sign(sx);
-  if (!leadY && Math.abs(sy) >= gate) leadY = Math.sign(sy);
+  // lukitaan akselin suunta JA herätyshetki ensimmäisestä otoksesta,
+  // joka ylittää portin
+  if (!leadX && Math.abs(sx) >= gate){ leadX = Math.sign(sx); onsetX = now; }
+  if (!leadY && Math.abs(sy) >= gate){ leadY = Math.sign(sy); onsetY = now; }
 
   // vain lukitun suunnan mukaiset otokset kasvattavat voimakkuutta
   if (leadX && Math.sign(sx) === leadX) strX = Math.max(strX, Math.abs(sx));
@@ -698,23 +705,25 @@ function sampleTap(sx, sy){
 }
 
 function resolveTap(){
-  const horizontal = strX >= strY;
-  const win   = horizontal ? strX : strY;
-  const other = horizontal ? strY : strX;
-
-  // epäselvä isku: akselit liian tasaväkiset
-  if (other * DOMINANCE > win){ rejectTap('epäselvä'); return false; }
+  /* Akseli ratkaistaan HERÄTYSJÄRJESTYKSESTÄ, ei voimakkuudesta.
+     Kopautus kädessä olevaan puhelimeen kiertää sitä, ja kierrosta syntyvä
+     kohtisuora komponentti voi olla itse iskua voimakkaampi — mutta se
+     saapuu aina hieman perässä. Voimakkuusvertailu meni tähän ansaan;
+     ajoitusvertailu ei. */
+  const horizontal = (onsetX === onsetY) ? (strX >= strY) : (onsetX < onsetY);
 
   if (horizontal){
-    if (win < sens.side){ rejectTap('liian kevyt'); return false; }
+    if (!leadX){ rejectTap('epäselvä'); return false; }
+    if (strX < sens.side){ rejectTap('liian kevyt'); return false; }
     const pushedRight = leadX > 0;                 // kopautus vasempaan reunaan
     move((inverted ? !pushedRight : pushedRight) ? 1 : -1);
     flashZone(pushedRight ? 'left' : 'right');
     if (navigator.vibrate) navigator.vibrate(10);
   } else {
+    if (!leadY){ rejectTap('epäselvä'); return false; }
     const pushedUp = leadY > 0;                    // kopautus alareunaan
     const doRotate = inverted ? !pushedUp : pushedUp;
-    if (win < (doRotate ? sens.rot : sens.drop)){ rejectTap('liian kevyt'); return false; }
+    if (strY < (doRotate ? sens.rot : sens.drop)){ rejectTap('liian kevyt'); return false; }
     if (doRotate) rotate(); else hardDrop();
     flashZone(pushedUp ? 'bottom' : 'top');
     if (navigator.vibrate) navigator.vibrate(doRotate ? 10 : [8, 30, 14]);
@@ -862,7 +871,7 @@ function startGame(){
   score = 0; lines = 0; level = 1;
   softDropping = false;
   gameOver = false; paused = false; running = true;
-  capturing = false; armed = true; lastAction = performance.now();
+  capturing = false; armed = true; cooldownUntil = performance.now() + REFRACTORY;
   spawn();
   updateStats();
   $('startScreen').hidden = true;
