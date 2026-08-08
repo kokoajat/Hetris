@@ -113,10 +113,13 @@
     background:#3B4757; border-radius:3px;
   }
   .meter .fill.over{ background:var(--accent); }
-  .meter .mark{
-    position:absolute; top:-2px; bottom:-2px; left:50%;
-    width:2px; background:var(--muted); opacity:.7;
+  .meter .tick{
+    position:absolute; top:-3px; bottom:-3px;
+    width:2px; margin-left:-1px; border-radius:1px;
   }
+  #tickSide{ background:#4CC9F0; }
+  #tickDrop{ background:#EF476F; }
+  #tickRot{  background:#C77DFF; }
 
   /* ---------- napit ---------- */
   .bar{ display:flex; gap:8px; }
@@ -136,6 +139,7 @@
     display:flex; flex-direction:column; align-items:center; justify-content:center;
     gap:14px; text-align:center; padding:22px;
     background:rgba(11,14,19,.93); border-radius:12px; z-index:5;
+    overflow-y:auto;
   }
   .overlay[hidden]{ display:none; }
   .overlay h1{ margin:0; font-size:36px; font-weight:700; letter-spacing:.24em; text-indent:.24em; }
@@ -147,12 +151,41 @@
   .err{ color:var(--danger); font-size:12px; max-width:32ch; }
 
   .settings{ width:100%; max-width:300px; text-align:left; }
+  .settings .row{ margin-bottom:12px; }
   .settings label{
     font-size:11px; letter-spacing:.14em; color:var(--muted);
-    text-transform:uppercase; display:block; margin-bottom:6px;
+    text-transform:uppercase; display:block; margin-bottom:5px;
   }
-  .settings input[type=range]{ width:100%; accent-color:var(--accent); }
-  .hint{ font-size:11px; color:#4E5C6E; margin-top:6px; line-height:1.5; }
+  .settings label .dot{
+    display:inline-block; width:8px; height:8px; border-radius:2px;
+    margin-right:6px; vertical-align:baseline;
+  }
+  .settings input[type=range]{ width:100%; accent-color:var(--accent); margin:0; }
+  .hint{ font-size:11px; color:#4E5C6E; margin-top:2px; line-height:1.5; }
+
+  /* kytkin */
+  .switch{
+    display:flex; align-items:center; justify-content:space-between;
+    gap:10px; padding:10px 0 2px; border-top:1px solid var(--line);
+  }
+  .switch span{
+    font-size:11px; letter-spacing:.14em; color:var(--muted); text-transform:uppercase;
+  }
+  .switch input{
+    appearance:none; -webkit-appearance:none;
+    width:46px; height:26px; flex:none; margin:0;
+    background:#0E131B; border:1px solid var(--line);
+    border-radius:13px; position:relative; cursor:pointer;
+    transition:background .16s, border-color .16s;
+  }
+  .switch input::after{
+    content:''; position:absolute; top:3px; left:3px;
+    width:18px; height:18px; border-radius:50%;
+    background:#3B4757; transition:transform .16s, background .16s;
+  }
+  .switch input:checked{ background:rgba(255,209,102,.18); border-color:var(--accent); }
+  .switch input:checked::after{ transform:translateX(20px); background:var(--accent); }
+  .switch input:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
 
   @media (prefers-reduced-motion: reduce){
     .zone{ transition:none; }
@@ -189,9 +222,23 @@
     <div class="overlay" id="pauseScreen" hidden>
       <h2>TAUKO</h2>
       <div class="settings">
-        <label for="tapSens">Kopautuksen voimakkuus · <span id="tapVal">8</span></label>
-        <input type="range" id="tapSens" min="3" max="20" step="1" value="8">
-        <div class="hint">Pienempi luku = kevyempi kopautus riittää. Alapalkin mittari näyttää kopautuksesi voiman, keskiviiva on nykyinen raja.</div>
+        <div class="row">
+          <label for="sensSide"><i class="dot" style="background:#4CC9F0"></i>Sivuttaissiirto · <span id="valSide">8</span></label>
+          <input type="range" id="sensSide" min="3" max="20" step="1" value="8">
+        </div>
+        <div class="row">
+          <label for="sensDrop"><i class="dot" style="background:#EF476F"></i>Pudotus · <span id="valDrop">11</span></label>
+          <input type="range" id="sensDrop" min="3" max="20" step="1" value="11">
+        </div>
+        <div class="row">
+          <label for="sensRot"><i class="dot" style="background:#C77DFF"></i>Kääntö · <span id="valRot">7</span></label>
+          <input type="range" id="sensRot" min="3" max="20" step="1" value="7">
+        </div>
+        <div class="switch">
+          <span>Käänteinen kopautus</span>
+          <input type="checkbox" id="invertTap" role="switch">
+        </div>
+        <div class="hint">Pienempi luku = kevyempi kopautus riittää. Alapalkin mittari näyttää kopautuksesi voiman; värilliset viivat ovat näiden säätimien rajat.</div>
       </div>
       <div class="btns">
         <button id="restartBtn">Uusi peli</button>
@@ -217,7 +264,9 @@
     </div>
     <div class="meter">
       <div class="fill" id="meterFill"></div>
-      <div class="mark"></div>
+      <div class="tick" id="tickSide"></div>
+      <div class="tick" id="tickDrop"></div>
+      <div class="tick" id="tickRot"></div>
     </div>
   </div>
 
@@ -537,10 +586,14 @@ function updateStats(){
    pala putoaa. Kopautus oikeaan reunaan työntää vasemmalle,
    joten pala siirtyy vasemmalle.
    ========================================================= */
-let tapThreshold = 8;        // ainoa herkkyyssäätö (m/s²)
+const sens = { side:8, drop:11, rot:7 };   // kynnykset (m/s²) suunnittain
+let inverted = false;                      // kääntää kopautuslogiikan
+const METER_MAX = 26;                      // mittarin kiinteä asteikko
 let useLinear = null;        // onko acceleration-kenttä käytettävissä
 let gX = 0, gY = 0;          // painovoiman liukuva arvio varareitille
 let motionReady = false;
+
+function minSens(){ return Math.min(sens.side, sens.drop, sens.rot); }
 
 /* Kopautuksen huippuarvon keruu: isku kestää vain hetken, joten
    otetaan ikkuna talteen ja päätetään suunta vahvimmasta otoksesta. */
@@ -583,28 +636,32 @@ function onMotion(e){
   const sx = ax * cos + ay * sin;   // + = puhelin työntyy oikealle
   const sy = ay * cos - ax * sin;   // + = puhelin työntyy ylös
 
-  const mag = Math.hypot(sx, sy);
+  // kopautuksen voimakkuus mitataan hallitsevalta akselilta, koska
+  // jokaisella suunnalla on nyt oma kynnyksensä
+  const axisMag = Math.max(Math.abs(sx), Math.abs(sy));
   const now = performance.now();
 
-  // mittari näyttää voimakkuuden myös tauolla, jotta herkkyyden voi säätää
-  if (mag > meterPeak) meterPeak = mag;
+  // mittari näyttää voimakkuuden myös tauolla, jotta rajat voi säätää
+  if (axisMag > meterPeak) meterPeak = axisMag;
 
   if (now - lastAction < REFRACTORY) return;
 
   if (!armed){
-    if (mag < tapThreshold * 0.35) armed = true;
+    if (axisMag < minSens() * 0.35) armed = true;
     return;
   }
 
   if (!capturing){
-    if (mag < tapThreshold) return;
+    // keruu alkaa matalimmasta rajasta; lopullinen tarkistus tehdään
+    // vasta kun suunta on selvillä
+    if (axisMag < minSens()) return;
     capturing = true; captureStart = now;
-    peakMag = mag; peakX = sx; peakY = sy;
+    peakMag = axisMag; peakX = sx; peakY = sy;
     return;
   }
 
   // kerätään ikkunan ajan vahvin otos
-  if (mag > peakMag){ peakMag = mag; peakX = sx; peakY = sy; }
+  if (axisMag > peakMag){ peakMag = axisMag; peakX = sx; peakY = sy; }
   if (now - captureStart < PEAK_WINDOW) return;
 
   capturing = false;
@@ -615,18 +672,22 @@ function onMotion(e){
 
 function fire(sx, sy){
   const vertical = Math.abs(sy) >= Math.abs(sx);
-  let zone;
 
   if (vertical){
-    if (sy > 0){ rotate();   zone = 'bottom'; }   // kopautus alhaalta
-    else       { hardDrop(); zone = 'top';    }   // kopautus ylhäältä
+    const pushedUp = sy > 0;                       // kopautus alareunaan
+    const doRotate = inverted ? !pushedUp : pushedUp;
+    const need = doRotate ? sens.rot : sens.drop;
+    if (Math.abs(sy) < need) return;               // liian kevyt tälle suunnalle
+    if (doRotate) rotate(); else hardDrop();
+    flashZone(pushedUp ? 'bottom' : 'top');
+    if (navigator.vibrate) navigator.vibrate(doRotate ? 10 : [8, 30, 14]);
   } else {
-    if (sx > 0){ move(1);  zone = 'left';  }      // kopautus vasemmalta
-    else       { move(-1); zone = 'right'; }      // kopautus oikealta
+    const pushedRight = sx > 0;                    // kopautus vasempaan reunaan
+    if (Math.abs(sx) < sens.side) return;
+    move((inverted ? !pushedRight : pushedRight) ? 1 : -1);
+    flashZone(pushedRight ? 'left' : 'right');
+    if (navigator.vibrate) navigator.vibrate(10);
   }
-
-  flashZone(zone);
-  if (navigator.vibrate) navigator.vibrate(zone === 'top' ? [8, 30, 14] : 10);
 }
 
 let zoneTimers = {};
@@ -641,9 +702,32 @@ function flashZone(name){
 /* Mittari: huippu näkyy hetken ja valuu sitten pois */
 function updateMeter(dt){
   meterPeak = Math.max(0, meterPeak - dt * 0.03);
-  const pct = Math.min(100, (meterPeak / (tapThreshold * 2)) * 100);
-  meterFill.style.width = pct + '%';
-  meterFill.classList.toggle('over', meterPeak >= tapThreshold);
+  meterFill.style.width = Math.min(100, (meterPeak / METER_MAX) * 100) + '%';
+  meterFill.classList.toggle('over', meterPeak >= minSens());
+}
+
+function updateTicks(){
+  $('tickSide').style.left = (sens.side / METER_MAX) * 100 + '%';
+  $('tickDrop').style.left = (sens.drop / METER_MAX) * 100 + '%';
+  $('tickRot').style.left  = (sens.rot  / METER_MAX) * 100 + '%';
+}
+
+/* Kompassin tekstit kertovat aina voimassa olevan logiikan */
+function updateCompassLabels(){
+  ZONES.top.textContent    = inverted ? 'Käännä' : 'Pudota';
+  ZONES.bottom.textContent = inverted ? 'Pudota' : 'Käännä';
+  ZONES.left.innerHTML     = inverted ? '\u2190 Vasemmalle' : 'Oikealle \u2192';
+  ZONES.right.innerHTML    = inverted ? 'Oikealle \u2192' : '\u2190 Vasemmalle';
+}
+
+/* Ruutunapautus välähtää sillä reunalla, joka tekisi saman kopautuksena */
+function zoneFor(action){
+  switch (action){
+    case 'left':   return inverted ? 'left' : 'right';
+    case 'right':  return inverted ? 'right' : 'left';
+    case 'drop':   return inverted ? 'bottom' : 'top';
+    default:       return inverted ? 'top' : 'bottom';
+  }
 }
 
 async function enableSensors(){
@@ -688,10 +772,10 @@ canvas.addEventListener('pointerdown', e => {
   const r = canvas.getBoundingClientRect();
   const fx = (e.clientX - r.left) / r.width;
   const fy = (e.clientY - r.top) / r.height;
-  if (fx < 0.3)      { move(-1);   flashZone('right');  }
-  else if (fx > 0.7) { move(1);    flashZone('left');   }
-  else if (fy < 0.5) { hardDrop(); flashZone('top');    }
-  else               { rotate();   flashZone('bottom'); }
+  if (fx < 0.3)      { move(-1);   flashZone(zoneFor('left'));  }
+  else if (fx > 0.7) { move(1);    flashZone(zoneFor('right')); }
+  else if (fy < 0.5) { hardDrop(); flashZone(zoneFor('drop'));  }
+  else               { rotate();   flashZone(zoneFor('rotate'));}
 });
 
 /* =========================================================
@@ -780,11 +864,24 @@ $('resumeBtn').addEventListener('click', togglePause);
 $('pauseBtn').addEventListener('click', togglePause);
 $('settingsBtn').addEventListener('click', () => { if (!paused) togglePause(); });
 
-$('tapSens').addEventListener('input', e => {
-  tapThreshold = Number(e.target.value);
-  $('tapVal').textContent = tapThreshold;
+function bindSlider(id, key, valId){
+  const el = $(id);
+  const apply = () => {
+    sens[key] = Number(el.value);
+    $(valId).textContent = el.value;
+    updateTicks();
+  };
+  el.addEventListener('input', apply);
+  apply();
+}
+bindSlider('sensSide', 'side', 'valSide');
+bindSlider('sensDrop', 'drop', 'valDrop');
+bindSlider('sensRot',  'rot',  'valRot');
+
+$('invertTap').addEventListener('change', e => {
+  inverted = e.target.checked;
+  updateCompassLabels();
 });
-tapThreshold = Number($('tapSens').value);
 
 window.addEventListener('resize', resize);
 if (screen.orientation && screen.orientation.addEventListener)
@@ -794,6 +891,7 @@ if (screen.orientation && screen.orientation.addEventListener)
    11. Käynnistys
    ========================================================= */
 board = emptyBoard();
+updateCompassLabels();
 resize();
 requestAnimationFrame(t => { lastFrame = t; loop(t); });
 
