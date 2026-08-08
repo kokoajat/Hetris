@@ -126,6 +126,10 @@
   #tickSide{ background:#4CC9F0; }
   #tickDrop{ background:#EF476F; }
   #tickRot{  background:#C77DFF; }
+  #tickTwist{ background:#06D6A0; }
+  #meterRot{ margin-top:4px; }
+  #meterRot .fill{ background:#2C4A45; }
+  #meterRot .fill.over{ background:#06D6A0; }
 
   /* ---------- napit ---------- */
   .bar{ display:flex; gap:8px; }
@@ -168,6 +172,13 @@
   }
   .settings input[type=range]{ width:100%; accent-color:var(--accent); margin:0; }
   .hint{ font-size:11px; color:#4E5C6E; margin-top:2px; line-height:1.5; }
+
+  /* tilanvalitsin */
+  .seg{ display:flex; gap:6px; margin-bottom:14px; }
+  .seg button{
+    flex:1; padding:9px 6px; font-size:12px; letter-spacing:.06em;
+  }
+  .seg button.on{ background:var(--accent); border-color:var(--accent); color:#1A1206; font-weight:700; }
 
   /* kytkin */
   .switch{
@@ -228,17 +239,21 @@
     <div class="overlay" id="pauseScreen" hidden>
       <h2>TAUKO</h2>
       <div class="settings">
-        <div class="row">
-          <label for="sensSide"><i class="dot" style="background:#4CC9F0"></i>Sivuttaissiirto · <span id="valSide">4</span></label>
-          <input type="range" id="sensSide" min="2.25" max="15" step="0.25" value="4">
+        <div class="seg">
+          <button type="button" id="modeTap" class="on">Kopautus</button>
+          <button type="button" id="modeTwist">Ranneväännös</button>
         </div>
         <div class="row">
-          <label for="sensDrop"><i class="dot" style="background:#EF476F"></i>Pudotus · <span id="valDrop">7</span></label>
-          <input type="range" id="sensDrop" min="2.25" max="15" step="0.25" value="7">
+          <label for="sensSide"><i class="dot" id="dotSide" style="background:#4CC9F0"></i><span id="labSide">Sivuttaissiirto</span> · <span id="valSide">5</span></label>
+          <input type="range" id="sensSide" min="2.25" max="15" step="0.25" value="5">
         </div>
         <div class="row">
-          <label for="sensRot"><i class="dot" style="background:#C77DFF"></i>Kääntö · <span id="valRot">5</span></label>
-          <input type="range" id="sensRot" min="2.25" max="15" step="0.25" value="5">
+          <label for="sensDrop"><i class="dot" style="background:#EF476F"></i>Pudotus · <span id="valDrop">3</span></label>
+          <input type="range" id="sensDrop" min="1.5" max="15" step="0.25" value="3">
+        </div>
+        <div class="row">
+          <label for="sensRot"><i class="dot" style="background:#C77DFF"></i>Kääntö · <span id="valRot">2.5</span></label>
+          <input type="range" id="sensRot" min="1.5" max="15" step="0.25" value="2.5">
         </div>
         <div class="switch">
           <span>Käänteinen kopautus</span>
@@ -273,6 +288,10 @@
       <div class="tick" id="tickSide"></div>
       <div class="tick" id="tickDrop"></div>
       <div class="tick" id="tickRot"></div>
+    </div>
+    <div class="meter" id="meterRot" hidden>
+      <div class="fill" id="rotFill"></div>
+      <div class="tick" id="tickTwist"></div>
     </div>
   </div>
 
@@ -324,7 +343,7 @@ let lastFrame = 0;
 const $ = id => document.getElementById(id);
 const canvas = $('board'), ctx = canvas.getContext('2d');
 const nextCanvas = $('next'), nctx = nextCanvas.getContext('2d');
-const meterFill = $('meterFill');
+const meterFill = $('meterFill'), rotFill = $('rotFill');
 const ZONES = { top:$('zTop'), bottom:$('zBottom'), left:$('zLeft'), right:$('zRight') };
 
 /* =========================================================
@@ -592,14 +611,26 @@ function updateStats(){
    pala putoaa. Kopautus oikeaan reunaan työntää vasemmalle,
    joten pala siirtyy vasemmalle.
    ========================================================= */
-const sens = { side:4, drop:7, rot:5 };    // kynnykset (m/s²) suunnittain
+/* Kynnykset. Pystykopautus on fysikaalisesti HEIKOMPI kuin sivukopautus:
+   sivuisku saa otepisteen ympäri syntyvästä kierrosta ison lisän anturin
+   kohdalla, pystyisku ei. Siksi pystyrajat ovat matalampia. */
+const sens = { side:5, drop:3, rot:2.5 };  // kopautuskynnykset (m/s²)
+let twistRate = 2.0;                       // väännöksen kynnys (rad/s)
+let sideMode = 'tap';                      // 'tap' | 'twist'
+const TWIST_SUPPRESS = 0.7;   // tämän osuuden yli menevä kierto vaimentaa kopautukset
+const TWIST_WINDOW   = 140;   // ms, väännös on kopautusta pidempi ele
+const DEG = Math.PI/180;
 let inverted = false;                      // kääntää kopautuslogiikan
 const METER_MAX = 18;                      // mittarin kiinteä asteikko
 let useLinear = null;        // onko acceleration-kenttä käytettävissä
 let gX = 0, gY = 0;          // painovoiman liukuva arvio varareitille
 let motionReady = false;
 
-function minSens(){ return Math.min(sens.side, sens.drop, sens.rot); }
+function minSens(){
+  // väännöstilassa sivuttaiskynnys ei ole kiihtyvyysraja lainkaan
+  return sideMode === 'twist' ? Math.min(sens.drop, sens.rot)
+                              : Math.min(sens.side, sens.drop, sens.rot);
+}
 
 /* Kopautuksen tunnistus.
    ---------------------------------------------------------------
@@ -620,8 +651,10 @@ let capturing = false, captureStart = 0;
 let leadX = 0, leadY = 0;     // akselin lukittu suunta (-1 / 0 / 1)
 let strX = 0, strY = 0;       // voimakkuus lukittuun suuntaan
 let onsetX = Infinity, onsetY = Infinity;   // milloin akseli heräsi
+let peakW = 0;                // kulmanopeuden huippu (rad/s), etumerkki mukana
+let gyroReady = null;         // onko rotationRate käytettävissä
 let cooldownUntil = 0, armed = true;
-let meterPeak = 0;
+let meterPeak = 0, rotPeak = 0;
 
 function screenAngle(){
   if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
@@ -657,11 +690,18 @@ function onMotion(e){
   const sx = ax * cos + ay * sin;   // + = puhelin työntyy oikealle
   const sy = ay * cos - ax * sin;   // + = puhelin työntyy ylös
 
+  // kulmanopeus puhelimen tason ympäri (z), rad/s
+  const rr = e.rotationRate;
+  let wz = 0;
+  if (rr && typeof rr.alpha === 'number'){ wz = rr.alpha * DEG; gyroReady = true; }
+  else if (gyroReady === null) gyroReady = false;
+
   const axisMag = Math.max(Math.abs(sx), Math.abs(sy));
   const now = performance.now();
 
-  // mittari näyttää voimakkuuden myös tauolla, jotta rajat voi säätää
+  // mittarit näyttävät voimakkuuden myös tauolla, jotta rajat voi säätää
   if (axisMag > meterPeak) meterPeak = axisMag;
+  if (Math.abs(wz) > rotPeak) rotPeak = Math.abs(wz);
 
   if (now < cooldownUntil) return;
 
@@ -673,25 +713,29 @@ function onMotion(e){
   }
 
   if (!capturing){
-    // keruu alkaa matalimmasta rajasta; suuntakohtainen tarkistus
-    // tehdään vasta kun akseli on selvillä
-    if (axisMag < minSens()) return;
+    // keruu alkaa matalimmasta rajasta — väännöstilassa myös riittävästä
+    // kierrosta, koska sen kiihtyvyysjälki voi jäädä kynnyksen alle
+    const wake = axisMag >= minSens() ||
+                 (sideMode === 'twist' && Math.abs(wz) >= twistRate * 0.5);
+    if (!wake) return;
     capturing = true; captureStart = now;
     leadX = leadY = 0; strX = strY = 0;
-    onsetX = onsetY = Infinity;
-    sampleTap(sx, sy, now);
+    onsetX = onsetY = Infinity; peakW = 0;
+    sampleTap(sx, sy, now, wz);
     return;
   }
 
-  sampleTap(sx, sy, now);
-  if (now - captureStart < CAPTURE_WINDOW) return;
+  sampleTap(sx, sy, now, wz);
+  const window = sideMode === 'twist' ? TWIST_WINDOW : CAPTURE_WINDOW;
+  if (now - captureStart < window) return;
 
   capturing = false;
   armed = false;
   cooldownUntil = now + (resolveTap() ? REFRACTORY : REJECT_PAUSE);
 }
 
-function sampleTap(sx, sy, now){
+function sampleTap(sx, sy, now, wz){
+  if (Math.abs(wz) > Math.abs(peakW)) peakW = wz;
   const gate = minSens() * GATE_FACTOR;
 
   // lukitaan akselin suunta JA herätyshetki ensimmäisestä otoksesta,
@@ -705,11 +749,28 @@ function sampleTap(sx, sy, now){
 }
 
 function resolveTap(){
-  /* Akseli ratkaistaan HERÄTYSJÄRJESTYKSESTÄ, ei voimakkuudesta.
-     Kopautus kädessä olevaan puhelimeen kiertää sitä, ja kierrosta syntyvä
-     kohtisuora komponentti voi olla itse iskua voimakkaampi — mutta se
-     saapuu aina hieman perässä. Voimakkuusvertailu meni tähän ansaan;
-     ajoitusvertailu ei. */
+  /* VÄÄNNÖSTILA: sivuttaissiirto luetaan gyrosta, pysty kiihtyvyydestä.
+     Nämä ovat eri antureita, joten akseleita ei tarvitse erotella
+     toisistaan lainkaan — juuri siksi tämä tila on tarkempi. */
+  if (sideMode === 'twist'){
+    if (Math.abs(peakW) >= twistRate){
+      // vastapäivään (ωz > 0) = kuin rattia vasemmalle
+      const left = peakW > 0;
+      move((inverted ? !left : left) ? -1 : 1);
+      flashZone(left ? 'left' : 'right');
+      if (navigator.vibrate) navigator.vibrate(10);
+      return true;
+    }
+    // Vaimennus: keskeneräisen väännöksen kiihtyvyysjälki ei saa
+    // laukaista pudotusta.
+    if (Math.abs(peakW) >= twistRate * TWIST_SUPPRESS){
+      rejectTap('vajaa väännös'); return false;
+    }
+    return resolveVertical();
+  }
+
+  /* KOPAUTUSTILA: akseli ratkaistaan herätysjärjestyksestä ja
+     voimakkuudesta. Simulaatio: n. 82 % oikein, 4 % väärään suuntaan. */
   const horizontal = (onsetX === onsetY) ? (strX >= strY) : (onsetX < onsetY);
 
   if (horizontal){
@@ -719,15 +780,19 @@ function resolveTap(){
     move((inverted ? !pushedRight : pushedRight) ? 1 : -1);
     flashZone(pushedRight ? 'left' : 'right');
     if (navigator.vibrate) navigator.vibrate(10);
-  } else {
-    if (!leadY){ rejectTap('epäselvä'); return false; }
-    const pushedUp = leadY > 0;                    // kopautus alareunaan
-    const doRotate = inverted ? !pushedUp : pushedUp;
-    if (strY < (doRotate ? sens.rot : sens.drop)){ rejectTap('liian kevyt'); return false; }
-    if (doRotate) rotate(); else hardDrop();
-    flashZone(pushedUp ? 'bottom' : 'top');
-    if (navigator.vibrate) navigator.vibrate(doRotate ? 10 : [8, 30, 14]);
+    return true;
   }
+  return resolveVertical();
+}
+
+function resolveVertical(){
+  if (!leadY){ rejectTap('epäselvä'); return false; }
+  const pushedUp = leadY > 0;                      // kopautus alareunaan
+  const doRotate = inverted ? !pushedUp : pushedUp;
+  if (strY < (doRotate ? sens.rot : sens.drop)){ rejectTap('liian kevyt'); return false; }
+  if (doRotate) rotate(); else hardDrop();
+  flashZone(pushedUp ? 'bottom' : 'top');
+  if (navigator.vibrate) navigator.vibrate(doRotate ? 10 : [8, 30, 14]);
   return true;
 }
 
@@ -741,7 +806,7 @@ function rejectTap(reason){
   clearTimeout(coreTimer);
   coreTimer = setTimeout(() => {
     core.classList.remove('miss');
-    core.innerHTML = 'Kopauta<br>reunaa';
+    core.innerHTML = sideMode === 'twist' ? 'Väännä<br>ranteella' : 'Kopauta<br>reunaa';
   }, 500);
 }
 
@@ -754,29 +819,49 @@ function flashZone(name){
   zoneTimers[name] = setTimeout(() => el.classList.remove('hit'), 170);
 }
 
-/* Mittari: huippu näkyy hetken ja valuu sitten pois */
+/* Mittarit: huippu näkyy hetken ja valuu sitten pois */
+const ROT_MAX = 5;            // gyromittarin asteikko (rad/s)
 function updateMeter(dt){
   meterPeak = Math.max(0, meterPeak - dt * 0.03);
   meterFill.style.width = Math.min(100, (meterPeak / METER_MAX) * 100) + '%';
   meterFill.classList.toggle('over', meterPeak >= minSens());
+
+  if (sideMode === 'twist'){
+    rotPeak = Math.max(0, rotPeak - dt * 0.006);
+    rotFill.style.width = Math.min(100, (rotPeak / ROT_MAX) * 100) + '%';
+    rotFill.classList.toggle('over', rotPeak >= twistRate);
+  }
 }
 
 function updateTicks(){
   $('tickSide').style.left = (sens.side / METER_MAX) * 100 + '%';
   $('tickDrop').style.left = (sens.drop / METER_MAX) * 100 + '%';
   $('tickRot').style.left  = (sens.rot  / METER_MAX) * 100 + '%';
+  $('tickTwist').style.left = (twistRate / ROT_MAX) * 100 + '%';
+  $('tickSide').hidden = (sideMode === 'twist');
+  $('meterRot').hidden = (sideMode !== 'twist');
 }
 
 /* Kompassin tekstit kertovat aina voimassa olevan logiikan */
 function updateCompassLabels(){
   ZONES.top.textContent    = inverted ? 'Käännä' : 'Pudota';
   ZONES.bottom.textContent = inverted ? 'Pudota' : 'Käännä';
-  ZONES.left.innerHTML     = inverted ? '\u2190 Vasemmalle' : 'Oikealle \u2192';
-  ZONES.right.innerHTML    = inverted ? 'Oikealle \u2192' : '\u2190 Vasemmalle';
+
+  if (sideMode === 'twist'){
+    // väännöstilassa reunat eivät kuvaa kopautuspaikkaa vaan lopputulosta
+    ZONES.left.innerHTML  = '\u21BA Vasemmalle';
+    ZONES.right.innerHTML = 'Oikealle \u21BB';
+    $('tapCore').innerHTML = 'Väännä<br>ranteella';
+  } else {
+    ZONES.left.innerHTML  = inverted ? '\u2190 Vasemmalle' : 'Oikealle \u2192';
+    ZONES.right.innerHTML = inverted ? 'Oikealle \u2192' : '\u2190 Vasemmalle';
+    $('tapCore').innerHTML = 'Kopauta<br>reunaa';
+  }
 }
 
 /* Ruutunapautus välähtää sillä reunalla, joka tekisi saman kopautuksena */
 function zoneFor(action){
+  if (sideMode === 'twist' && (action === 'left' || action === 'right')) return action;
   switch (action){
     case 'left':   return inverted ? 'left' : 'right';
     case 'right':  return inverted ? 'right' : 'left';
@@ -922,8 +1007,13 @@ $('settingsBtn').addEventListener('click', () => { if (!paused) togglePause(); }
 function bindSlider(id, key, valId){
   const el = $(id);
   const apply = () => {
-    sens[key] = Number(el.value);
-    $(valId).textContent = el.value;
+    if (key === 'side' && sideMode === 'twist'){
+      twistRate = Number(el.value);
+      $(valId).textContent = el.value + ' rad/s';
+    } else {
+      sens[key] = Number(el.value);
+      $(valId).textContent = el.value;
+    }
     updateTicks();
   };
   el.addEventListener('input', apply);
@@ -932,6 +1022,37 @@ function bindSlider(id, key, valId){
 bindSlider('sensSide', 'side', 'valSide');
 bindSlider('sensDrop', 'drop', 'valDrop');
 bindSlider('sensRot',  'rot',  'valRot');
+
+/* Sivuttaisohjauksen tila: kopautus (kiihtyvyys) tai ranneväännös (gyro).
+   Sama liukusäädin palvelee kumpaakin, mutta yksikkö ja asteikko vaihtuvat. */
+function setSideMode(mode){
+  sideMode = mode;
+  $('modeTap').classList.toggle('on', mode === 'tap');
+  $('modeTwist').classList.toggle('on', mode === 'twist');
+  const el = $('sensSide');
+  if (mode === 'twist'){
+    $('labSide').textContent = 'Väännöksen voimakkuus';
+    $('dotSide').style.background = '#06D6A0';
+    el.min = 1; el.max = 4; el.step = 0.1; el.value = twistRate;
+    $('valSide').textContent = twistRate + ' rad/s';
+  } else {
+    $('labSide').textContent = 'Sivuttaissiirto';
+    $('dotSide').style.background = '#4CC9F0';
+    el.min = 2.25; el.max = 15; el.step = 0.25; el.value = sens.side;
+    $('valSide').textContent = String(sens.side);
+  }
+  updateTicks();
+  updateCompassLabels();
+  capturing = false; armed = true;
+}
+$('modeTap').addEventListener('click', () => setSideMode('tap'));
+$('modeTwist').addEventListener('click', () => {
+  if (gyroReady === false){
+    rejectTap('ei gyroa');
+    return;
+  }
+  setSideMode('twist');
+});
 
 $('invertTap').addEventListener('change', e => {
   inverted = e.target.checked;
