@@ -141,6 +141,7 @@
     will-change:transform;
   }
   .level .bubble.active{ background:var(--accent); box-shadow:0 0 14px rgba(255,209,102,.55); }
+  .level .bubble.locked{ background:#26303D; border:2px solid #3B4757; }
   .level .flash{
     position:absolute; inset:0;
     border-radius:13px;
@@ -242,7 +243,7 @@
     <div class="overlay" id="startScreen">
       <div class="tag">Kallista · heilauta · pinoa</div>
       <h1>VAAKA</h1>
-      <p>Kallista puhelinta sivulle niin palikka liikkuu. Heilauta ylöspäin niin se kääntyy. Napauta ruutua pudottaaksesi.</p>
+      <p>Kallista sivulle: palikka siirtyy yhden ruudun. Suorista puhelin ennen seuraavaa siirtoa. Heilauta ylös = käännä, alas = pudota.</p>
       <div class="btns"><button class="primary" id="startBtn">Aloita peli</button></div>
       <div class="keys">Tietokoneella: ← → siirrä · ↑ käännä · ↓ pehmeä pudotus · väli = pudota · P = tauko</div>
       <div class="err" id="sensorErr" hidden></div>
@@ -252,12 +253,12 @@
       <h2>TAUKO</h2>
       <div class="settings">
         <div>
-          <label for="tiltSens">Kallistuksen herkkyys</label>
-          <input type="range" id="tiltSens" min="4" max="20" step="1" value="9">
+          <label for="tiltSens">Kallistuskulma · <span id="tiltVal">12°</span></label>
+          <input type="range" id="tiltSens" min="4" max="20" step="1" value="12">
         </div>
         <div>
-          <label for="shakeSens">Heilautuksen herkkyys</label>
-          <input type="range" id="shakeSens" min="6" max="22" step="1" value="13">
+          <label for="shakeSens">Heilautuksen herkkyys · <span id="shakeVal">5 m/s²</span></label>
+          <input type="range" id="shakeSens" min="3" max="11" step="1" value="8">
         </div>
       </div>
       <div class="btns">
@@ -329,12 +330,14 @@ let lastFrame = 0;
 const LOCK_DELAY = 500, MAX_LOCK_RESETS = 15;
 
 /* Anturit */
-let neutralTilt = 0;      // kalibroitu nolla-asento
-let rawTilt = 0;          // suodatettu kallistus asteina
-let tiltMoveTimer = 0;
-let tiltDeadzone = 9;     // säädettävä
-let shakeThreshold = 13;  // säädettävä (m/s²)
-let lastShake = 0, shakeArmed = true;
+let neutralTilt = 0;        // kalibroitu nolla-asento
+let rawTilt = 0;            // suodatettu kallistus asteina
+let tiltThreshold = 12;     // kuinka jyrkkä kallistus siirtää palan (astetta)
+let tiltLatched = false;    // tosi = odotetaan puhelimen suoristamista
+let flickThreshold = 5;     // heilautuksen kynnys (m/s²)
+let lastGesture = 0, gestureArmed = true;
+let useLinear = null;       // onko acceleration-kenttä käytettävissä
+let gX = 0, gY = 0;         // painovoiman liukuva arvio varareitille
 let motionReady = false;
 
 /* DOM */
@@ -613,7 +616,7 @@ function loop(now){
   if (!playable()) return;
 
   // kallistuksesta johtuva sivuliike
-  applyTilt(dt);
+  applyTilt();
 
   // painovoima
   const interval = softDropping ? Math.min(60, dropInterval()) : dropInterval();
@@ -640,25 +643,21 @@ function loop(now){
 /* =========================================================
    7. Kallistusohjaus
    ========================================================= */
-function applyTilt(dt){
+/* Yksi kallistus = yksi ruutu. Uusi siirto vaatii puhelimen suoristamisen. */
+function applyTilt(){
   const t = rawTilt - neutralTilt;
   const mag = Math.abs(t);
 
-  if (mag < tiltDeadzone){
-    tiltMoveTimer = 999;   // heti valmis liikkumaan kun ylitetään raja
-    bubble.classList.remove('active');
+  if (tiltLatched){
+    // vapautetaan vasta selvästi kynnyksen alapuolella (hystereesi)
+    if (mag < tiltThreshold * 0.45) tiltLatched = false;
     return;
   }
-  bubble.classList.add('active');
 
-  // mitä jyrkempi kallistus, sitä tiheämpi toisto
-  const over = Math.min(mag - tiltDeadzone, 22);
-  const repeat = 250 - (over / 22) * 180;   // 250ms → 70ms
-
-  tiltMoveTimer += dt;
-  if (tiltMoveTimer >= repeat){
-    tiltMoveTimer = 0;
+  if (mag >= tiltThreshold){
+    tiltLatched = true;
     move(t > 0 ? 1 : -1);
+    if (navigator.vibrate) navigator.vibrate(8);
   }
 }
 
@@ -668,10 +667,20 @@ function pulse(){
 }
 
 function updateBubble(){
-  const t = Math.max(-30, Math.min(30, rawTilt - neutralTilt));
+  const raw = rawTilt - neutralTilt;
+  const t = Math.max(-30, Math.min(30, raw));
   const track = bubble.parentElement.clientWidth;
   bubble.style.transform = 'translateX(' + (t / 30) * (track / 2 - 14) + 'px)';
-  tiltRead.textContent = Math.round(t) + '°';
+
+  if (tiltLatched){
+    bubble.classList.remove('active');
+    bubble.classList.add('locked');
+    tiltRead.textContent = 'suorista';
+  } else {
+    bubble.classList.remove('locked');
+    bubble.classList.toggle('active', Math.abs(raw) >= tiltThreshold * 0.7);
+    tiltRead.textContent = Math.round(t) + '°';
+  }
 }
 
 function screenAngle(){
@@ -694,25 +703,52 @@ function onOrientation(e){
 }
 
 function onMotion(e){
-  const acc = e.acceleration && e.acceleration.y !== null
-    ? e.acceleration
-    : null;
-  if (!acc) return;             // ilman painovoimaa erotettua dataa ei luoteta
+  let ax, ay;
+
+  // Päätetään kerran, saadaanko painovoimasta eroteltua kiihtyvyyttä
+  if (useLinear === null){
+    useLinear = !!(e.acceleration && typeof e.acceleration.y === 'number');
+  }
+
+  if (useLinear){
+    ax = e.acceleration.x || 0;
+    ay = e.acceleration.y || 0;
+  } else {
+    const g = e.accelerationIncludingGravity;
+    if (!g || typeof g.y !== 'number') return;
+    // ylipäästösuodatin: vähennetään hitaasti muuttuva painovoimakomponentti
+    gX = gX * 0.9 + (g.x || 0) * 0.1;
+    gY = gY * 0.9 + (g.y || 0) * 0.1;
+    ax = (g.x || 0) - gX;
+    ay = (g.y || 0) - gY;
+  }
   motionReady = true;
 
   const a = ((screenAngle() % 360) + 360) % 360;
   const rad = a * Math.PI / 180;
   // ruudun "ylös"-suuntainen kiihtyvyyskomponentti
-  const up = acc.y * Math.cos(rad) - acc.x * Math.sin(rad);
+  const up = ay * Math.cos(rad) - ax * Math.sin(rad);
 
   const now = performance.now();
-  if (shakeArmed && up > shakeThreshold && now - lastShake > 280){
-    shakeArmed = false;
-    lastShake = now;
+
+  // Heilautuksen jälkeen tulee aina vastaliike — odotetaan se rauhassa yli
+  if (now - lastGesture < 380) return;
+
+  if (!gestureArmed){
+    if (Math.abs(up) < flickThreshold * 0.35) gestureArmed = true;
+    return;
+  }
+
+  if (up > flickThreshold){
+    gestureArmed = false; lastGesture = now;
     rotate();
     if (navigator.vibrate) navigator.vibrate(12);
+  } else if (up < -flickThreshold * 1.5){
+    // pudotus vaatii selvemmän liikkeen, koska sitä ei voi perua
+    gestureArmed = false; lastGesture = now;
+    hardDrop();
+    if (navigator.vibrate) navigator.vibrate([10, 40, 20]);
   }
-  if (up < shakeThreshold * 0.4) shakeArmed = true;
 }
 
 async function enableSensors(){
@@ -738,6 +774,8 @@ async function enableSensors(){
 
 function calibrate(){
   neutralTilt = rawTilt;
+  tiltLatched = false;
+  gestureArmed = true;
   updateBubble();
   if (navigator.vibrate) navigator.vibrate(20);
 }
@@ -770,16 +808,16 @@ canvas.addEventListener('pointerdown', e => {
 });
 canvas.addEventListener('pointermove', e => {
   if (!touchStart || !playable()) return;
-  if (e.clientY - touchStart.y > 50){
+  if (e.clientY - touchStart.y > 60 && !touchStart.moved){
     touchStart.moved = true;
-    softDropping = true;
+    hardDrop();
   }
 });
-canvas.addEventListener('pointerup', e => {
+canvas.addEventListener('pointerup', () => {
   if (!touchStart) return;
   const dur = performance.now() - touchStart.t;
   softDropping = false;
-  if (!touchStart.moved && dur < 300) hardDrop();
+  if (!touchStart.moved && dur < 300) rotate();   // napautus kääntää
   touchStart = null;
 });
 canvas.addEventListener('pointercancel', () => { touchStart = null; softDropping = false; });
@@ -799,6 +837,9 @@ function startGame(){
   $('overScreen').hidden = true;
   $('pauseScreen').hidden = true;
   neutralTilt = rawTilt;    // nollaa asento aloitushetken mukaan
+  tiltLatched = false;
+  gestureArmed = true;
+  lastGesture = performance.now();
   keepAwake();
   draw();
 }
@@ -840,16 +881,14 @@ $('pauseBtn').addEventListener('click', togglePause);
 $('calibBtn').addEventListener('click', calibrate);
 $('calibBtn2').addEventListener('click', calibrate);
 
-$('tiltSens').addEventListener('input', e => {
-  // suurempi arvo liukusäätimessä = herkempi = pienempi kuollut alue
-  tiltDeadzone = 24 - Number(e.target.value);
-});
-$('shakeSens').addEventListener('input', e => {
-  shakeThreshold = 28 - Number(e.target.value);
-});
-// alkuarvot liukusäätimistä
-tiltDeadzone = 24 - Number($('tiltSens').value);
-shakeThreshold = 28 - Number($('shakeSens').value);
+// Suurempi liukusäätimen arvo = herkempi = matalampi kynnys
+function readTiltSens(v){ tiltThreshold = 24 - Number(v); $('tiltVal').textContent = tiltThreshold + '°'; }
+function readShakeSens(v){ flickThreshold = 13 - Number(v); $('shakeVal').textContent = flickThreshold + ' m/s²'; }
+
+$('tiltSens').addEventListener('input', e => readTiltSens(e.target.value));
+$('shakeSens').addEventListener('input', e => readShakeSens(e.target.value));
+readTiltSens($('tiltSens').value);
+readShakeSens($('shakeSens').value);
 
 window.addEventListener('resize', resize);
 if (screen.orientation && screen.orientation.addEventListener)
