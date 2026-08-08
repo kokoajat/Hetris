@@ -94,11 +94,17 @@
   }
   .z-top{grid-area:top;} .z-bottom{grid-area:bottom;}
   .z-left{grid-area:left;} .z-right{grid-area:right;}
+  .core.miss{
+    border-color:var(--danger); color:var(--danger);
+    border-style:solid;
+  }
   .core{
     grid-area:core;
     border:2px dashed var(--line);
     border-radius:9px;
-    padding:9px 4px;
+    min-height:46px;
+    display:flex; align-items:center; justify-content:center;
+    padding:4px;
     text-align:center;
     font-size:10px; letter-spacing:.14em; text-transform:uppercase;
     color:#4E5C6E;
@@ -223,16 +229,16 @@
       <h2>TAUKO</h2>
       <div class="settings">
         <div class="row">
-          <label for="sensSide"><i class="dot" style="background:#4CC9F0"></i>Sivuttaissiirto · <span id="valSide">8</span></label>
-          <input type="range" id="sensSide" min="3" max="20" step="1" value="8">
+          <label for="sensSide"><i class="dot" style="background:#4CC9F0"></i>Sivuttaissiirto · <span id="valSide">5</span></label>
+          <input type="range" id="sensSide" min="2.25" max="15" step="0.25" value="5">
         </div>
         <div class="row">
-          <label for="sensDrop"><i class="dot" style="background:#EF476F"></i>Pudotus · <span id="valDrop">11</span></label>
-          <input type="range" id="sensDrop" min="3" max="20" step="1" value="11">
+          <label for="sensDrop"><i class="dot" style="background:#EF476F"></i>Pudotus · <span id="valDrop">8.5</span></label>
+          <input type="range" id="sensDrop" min="2.25" max="15" step="0.25" value="8.5">
         </div>
         <div class="row">
-          <label for="sensRot"><i class="dot" style="background:#C77DFF"></i>Kääntö · <span id="valRot">7</span></label>
-          <input type="range" id="sensRot" min="3" max="20" step="1" value="7">
+          <label for="sensRot"><i class="dot" style="background:#C77DFF"></i>Kääntö · <span id="valRot">6</span></label>
+          <input type="range" id="sensRot" min="2.25" max="15" step="0.25" value="6">
         </div>
         <div class="switch">
           <span>Käänteinen kopautus</span>
@@ -258,7 +264,7 @@
     <div class="grid">
       <div class="zone z-top"    id="zTop">Pudota</div>
       <div class="zone z-left"   id="zLeft">Oikealle &rarr;</div>
-      <div class="core">Kopauta<br>reunaa</div>
+      <div class="core" id="tapCore">Kopauta<br>reunaa</div>
       <div class="zone z-right"  id="zRight">&larr; Vasemmalle</div>
       <div class="zone z-bottom" id="zBottom">Käännä</div>
     </div>
@@ -586,22 +592,34 @@ function updateStats(){
    pala putoaa. Kopautus oikeaan reunaan työntää vasemmalle,
    joten pala siirtyy vasemmalle.
    ========================================================= */
-const sens = { side:8, drop:11, rot:7 };   // kynnykset (m/s²) suunnittain
+const sens = { side:5, drop:8.5, rot:6 };  // kynnykset (m/s²) suunnittain
 let inverted = false;                      // kääntää kopautuslogiikan
-const METER_MAX = 26;                      // mittarin kiinteä asteikko
+const METER_MAX = 18;                      // mittarin kiinteä asteikko
 let useLinear = null;        // onko acceleration-kenttä käytettävissä
 let gX = 0, gY = 0;          // painovoiman liukuva arvio varareitille
 let motionReady = false;
 
 function minSens(){ return Math.min(sens.side, sens.drop, sens.rot); }
 
-/* Kopautuksen huippuarvon keruu: isku kestää vain hetken, joten
-   otetaan ikkuna talteen ja päätetään suunta vahvimmasta otoksesta. */
-const PEAK_WINDOW = 70;      // ms, kuinka kauan huippua etsitään
-const REFRACTORY  = 200;     // ms, tauko laukaisun jälkeen
+/* Kopautuksen tunnistus.
+   ---------------------------------------------------------------
+   Isku näkyy anturissa nousevana reunana ja sitä seuraavana
+   vastaheilahduksena, joka on kädessä pidettävässä puhelimessa usein
+   voimakkaampi kuin isku itse. Siksi kummankin akselin suunta lukitaan
+   sen ENSIMMÄISESTÄ merkittävästä otoksesta, ja voimakkuudeksi lasketaan
+   vain samansuuntaiset otokset. Ilman tätä vastaheilahdus voitti ja pala
+   liikkui vastakkaiseen suuntaan kuin kopautettiin.
+   Lisäksi voittavan akselin on oltava selvästi toista vahvempi, muuten
+   isku hylätään epäselvänä — arvaus väärään suuntaan on pelaajalle
+   pahempi kuin tekemätön siirto. */
+const CAPTURE_WINDOW = 60;    // ms, kuinka kauan iskua seurataan
+const REFRACTORY     = 200;   // ms, tauko onnistuneen laukaisun jälkeen
+const REJECT_PAUSE   = 90;    // ms, lyhyempi tauko hylätyn iskun jälkeen
+const DOMINANCE      = 1.35;  // voittavan akselin vaadittu ylivoima
 let capturing = false, captureStart = 0;
-let peakMag = 0, peakX = 0, peakY = 0;
-let lastAction = 0, armed = true;
+let leadX = 0, leadY = 0;     // akselin lukittu suunta (-1 / 0 / 1)
+let strX = 0, strY = 0;       // voimakkuus lukittuun suuntaan
+let cooldownUntil = 0, armed = true;
 let meterPeak = 0;
 
 function screenAngle(){
@@ -636,15 +654,13 @@ function onMotion(e){
   const sx = ax * cos + ay * sin;   // + = puhelin työntyy oikealle
   const sy = ay * cos - ax * sin;   // + = puhelin työntyy ylös
 
-  // kopautuksen voimakkuus mitataan hallitsevalta akselilta, koska
-  // jokaisella suunnalla on nyt oma kynnyksensä
   const axisMag = Math.max(Math.abs(sx), Math.abs(sy));
   const now = performance.now();
 
   // mittari näyttää voimakkuuden myös tauolla, jotta rajat voi säätää
   if (axisMag > meterPeak) meterPeak = axisMag;
 
-  if (now - lastAction < REFRACTORY) return;
+  if (now < cooldownUntil) return;
 
   if (!armed){
     if (axisMag < minSens() * 0.35) armed = true;
@@ -652,42 +668,72 @@ function onMotion(e){
   }
 
   if (!capturing){
-    // keruu alkaa matalimmasta rajasta; lopullinen tarkistus tehdään
-    // vasta kun suunta on selvillä
+    // keruu alkaa matalimmasta rajasta; suuntakohtainen tarkistus
+    // tehdään vasta kun akseli on selvillä
     if (axisMag < minSens()) return;
     capturing = true; captureStart = now;
-    peakMag = axisMag; peakX = sx; peakY = sy;
+    leadX = leadY = 0; strX = strY = 0;
+    sampleTap(sx, sy);
     return;
   }
 
-  // kerätään ikkunan ajan vahvin otos
-  if (axisMag > peakMag){ peakMag = axisMag; peakX = sx; peakY = sy; }
-  if (now - captureStart < PEAK_WINDOW) return;
+  sampleTap(sx, sy);
+  if (now - captureStart < CAPTURE_WINDOW) return;
 
   capturing = false;
   armed = false;
-  lastAction = now;
-  fire(peakX, peakY);
+  cooldownUntil = now + (resolveTap() ? REFRACTORY : REJECT_PAUSE);
 }
 
-function fire(sx, sy){
-  const vertical = Math.abs(sy) >= Math.abs(sx);
+function sampleTap(sx, sy){
+  const gate = minSens() * 0.4;
 
-  if (vertical){
-    const pushedUp = sy > 0;                       // kopautus alareunaan
-    const doRotate = inverted ? !pushedUp : pushedUp;
-    const need = doRotate ? sens.rot : sens.drop;
-    if (Math.abs(sy) < need) return;               // liian kevyt tälle suunnalle
-    if (doRotate) rotate(); else hardDrop();
-    flashZone(pushedUp ? 'bottom' : 'top');
-    if (navigator.vibrate) navigator.vibrate(doRotate ? 10 : [8, 30, 14]);
-  } else {
-    const pushedRight = sx > 0;                    // kopautus vasempaan reunaan
-    if (Math.abs(sx) < sens.side) return;
+  // lukitaan akselin suunta ensimmäisestä otoksesta, joka ylittää portin
+  if (!leadX && Math.abs(sx) >= gate) leadX = Math.sign(sx);
+  if (!leadY && Math.abs(sy) >= gate) leadY = Math.sign(sy);
+
+  // vain lukitun suunnan mukaiset otokset kasvattavat voimakkuutta
+  if (leadX && Math.sign(sx) === leadX) strX = Math.max(strX, Math.abs(sx));
+  if (leadY && Math.sign(sy) === leadY) strY = Math.max(strY, Math.abs(sy));
+}
+
+function resolveTap(){
+  const horizontal = strX >= strY;
+  const win   = horizontal ? strX : strY;
+  const other = horizontal ? strY : strX;
+
+  // epäselvä isku: akselit liian tasaväkiset
+  if (other * DOMINANCE > win){ rejectTap('epäselvä'); return false; }
+
+  if (horizontal){
+    if (win < sens.side){ rejectTap('liian kevyt'); return false; }
+    const pushedRight = leadX > 0;                 // kopautus vasempaan reunaan
     move((inverted ? !pushedRight : pushedRight) ? 1 : -1);
     flashZone(pushedRight ? 'left' : 'right');
     if (navigator.vibrate) navigator.vibrate(10);
+  } else {
+    const pushedUp = leadY > 0;                    // kopautus alareunaan
+    const doRotate = inverted ? !pushedUp : pushedUp;
+    if (win < (doRotate ? sens.rot : sens.drop)){ rejectTap('liian kevyt'); return false; }
+    if (doRotate) rotate(); else hardDrop();
+    flashZone(pushedUp ? 'bottom' : 'top');
+    if (navigator.vibrate) navigator.vibrate(doRotate ? 10 : [8, 30, 14]);
   }
+  return true;
+}
+
+/* Hylätty isku näytetään keskellä, jotta rajoja on helppo säätää:
+   pelaaja näkee että kopautus havaittiin mutta ei kelvannut. */
+let coreTimer = null;
+function rejectTap(reason){
+  const core = $('tapCore');
+  core.textContent = reason;
+  core.classList.add('miss');
+  clearTimeout(coreTimer);
+  coreTimer = setTimeout(() => {
+    core.classList.remove('miss');
+    core.innerHTML = 'Kopauta<br>reunaa';
+  }, 500);
 }
 
 let zoneTimers = {};
